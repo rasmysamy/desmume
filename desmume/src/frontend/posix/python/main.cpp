@@ -41,6 +41,7 @@ namespace py = pybind11;
 #endif
 
 #include "../NDSSystem.h"
+#include "../cheatSystem.h"
 #include "../driver.h"
 #include "../GPU.h"
 #include "../SPU.h"
@@ -95,7 +96,7 @@ static float nds_screen_size_ratio = 1.0f;
 #define NUM_FRAMES_TO_TIME 60
 #endif
 
-#define FPS_LIMITER_FPS 60
+int FPS_LIMITER_FPS = 60;
 
 static SDL_Window *window;
 static SDL_Renderer *renderer;
@@ -309,33 +310,75 @@ static void Draw(class configured_features *cfg) {
     return;
 }
 
+
+bool python_input = false;
+
+struct py_input{
+    long x;
+    long y;
+    int click;
+    int down;
+    bool keys[16];
+    void reset(){
+        x = 0;
+        y = 0;
+        click = 0;
+        down = 0;
+        for (int i = 0; i < 16; i++){
+            keys[i] = false;
+        }
+    }
+};
+
+py_input current_input;
+
 static void desmume_cycle(struct ctrls_event_config *cfg) {
     SDL_Event event;
 
     cfg->nds_screen_size_ratio = nds_screen_size_ratio;
 
-    /* Look for queued events and update keypad status */
-    /* IMPORTANT: Reenable joystick events iif needed. */
-    if (SDL_JoystickEventState(SDL_QUERY) == SDL_IGNORE)
-        SDL_JoystickEventState(SDL_ENABLE);
+    if (!python_input) {
+        /* Look for queued events and update keypad status */
+        /* IMPORTANT: Reenable joystick events iif needed. */
+        if (SDL_JoystickEventState(SDL_QUERY) == SDL_IGNORE)
+            SDL_JoystickEventState(SDL_ENABLE);
 
-    /* There's an event waiting to be processed? */
-    while (!cfg->sdl_quit &&
-           (SDL_PollEvent(&event) || (!cfg->focused && SDL_WaitEvent(&event)))) {
-        process_ctrls_event(event, cfg);
-    }
+        /* There's an event waiting to be processed? */
+        while (!cfg->sdl_quit &&
+               (SDL_PollEvent(&event) || (!cfg->focused && SDL_WaitEvent(&event)))) {
+            process_ctrls_event(event, cfg);
+        }
 
-    /* Update mouse position and click */
-    if (mouse.down) {
-        NDS_setTouchPos(mouse.x, mouse.y);
-        mouse.down = 2;
-    }
-    if (mouse.click) {
-        NDS_releaseTouch();
-        mouse.click = 0;
-    }
+        /* Update mouse position and click */
+        if (mouse.down) {
+            NDS_setTouchPos(mouse.x, mouse.y);
+            mouse.down = 2;
+        }
+        if (mouse.click) {
+            NDS_releaseTouch();
+            mouse.click = 0;
+        }
 
-    update_keypad(cfg->keypad);     /* Update keypad */
+        update_keypad(cfg->keypad);     /* Update keypad */
+    }
+    else{
+        if (current_input.down) {
+            NDS_setTouchPos(current_input.x, current_input.y);
+            current_input.down = 2;
+        }
+        if (current_input.click) {
+            NDS_releaseTouch();
+            current_input.click = 0;
+        }
+        u16 keys = 0;
+        for (int i = 0; i < 16; i++){
+            if (current_input.keys[i]){
+                keys |= 1 << i;
+            }
+        }
+        update_keypad(keys);
+        current_input.reset();
+    }
     NDS_exec<false>();
     SPU_Emulate_user();
 }
@@ -664,11 +707,9 @@ int add(int i, int j) {
 std::thread* desmume_thread;
 
 bool is_prepared = false;
+bool do_reset_jit;
 
 void run_desmume(std::string rom_path, bool frame_by_frame) {
-//    if (desmume_thread.joinable()) {
-//        desmume_thread.join();
-//    }
     int argc = 2;
     char *argv[] = {"desmume", (char *) rom_path.c_str(), NULL};
     if (!prepare(argc, argv))
@@ -681,14 +722,106 @@ void run_desmume(std::string rom_path, bool frame_by_frame) {
     }
 }
 
-void step_desmume() {
+void step_desmume(int steps) {
+    if (CommonSettings.use_jit){
+        if (do_reset_jit){
+            std::cout << "JIT reset, probably due to external write" << std::endl;
+            arm_jit_reset(true, true);
+            do_reset_jit = false;
+        }
+    }
     if (!is_prepared) return;
     if (ctrls_cfg.sdl_quit){
         teardown();
         is_prepared = false;
         return;
     }
-    execute_cycle();
+    for (int i = 0; i < steps; i++)
+        execute_cycle();
+}
+
+void set_python_input(bool input){
+    python_input = input;
+}
+
+void set_fps_limit(int fps){
+    FPS_LIMITER_FPS = fps;
+}
+
+py::dict get_current_input(){
+    py::dict input;
+    input["x"] = current_input.x;
+    input["y"] = current_input.y;
+    input["click"] = current_input.click;
+    input["down"] = current_input.down;
+    py::list keys;
+    for (int i = 0; i < 16; i++){
+        keys.append(current_input.keys[i]);
+    }
+    input["keys"] = keys;
+    return input;
+}
+
+py::dict set_current_input(py::dict input){
+    current_input.x = input["x"].cast<long>();
+    current_input.y = input["y"].cast<long>();
+    current_input.click = input["click"].cast<int>();
+    current_input.down = input["down"].cast<int>();
+    py::list keys = input["keys"];
+    for (int i = 0; i < 16; i++){
+        current_input.keys[i] = keys[i].cast<bool>();
+    }
+    return get_current_input();
+}
+
+int get_target_proc(const std::string& proc){
+    if (proc == "arm7")
+        return ARMCPU_ARM7;
+    else if (proc == "arm9")
+        return ARMCPU_ARM9;
+    else
+        throw std::invalid_argument("Invalid target processor : supported values are arm7 and arm9");
+}
+
+u32 read_memory(u32 addr, int length, std::string proc){
+    int target_proc = get_target_proc(proc);
+    switch (length) {
+        case 1:
+            return MMU_read8(target_proc, addr);
+        case 2:
+            return MMU_read16(target_proc, addr);
+        case 4:
+            return MMU_read32(target_proc, addr);
+    }
+    throw std::range_error("Invalid data length : supported values are 1, 2, and 4");
+}
+
+bool write_memory(u32 addr, u32 data, int byte_cnt, std::string proc){
+    int target_proc = get_target_proc(proc);
+
+    if (byte_cnt != 1 and byte_cnt != 2 and byte_cnt != 4)
+        throw std::range_error("Invalid data length : supported values are 1, 2, and 4");
+    u32 mask = 0;
+    for (int i = 0; i < 8*byte_cnt; i++){
+        mask |= 1 << i;
+    }
+    data = data&mask;
+    bool new_jit_reset;
+    switch (byte_cnt) {
+        case 1:
+            new_jit_reset = MMU_WriteFromExternal<u32, 1>(target_proc, addr, data);
+            break;
+        case 2:
+            new_jit_reset = MMU_WriteFromExternal<u32, 2>(target_proc, addr, data);
+            break;
+        case 4:
+            new_jit_reset = MMU_WriteFromExternal<u32, 4>(target_proc, addr, data);
+            break;
+        default:
+            throw std::range_error("Invalid data length : supported values are 1, 2, and 4");
+    }
+    do_reset_jit = new_jit_reset || do_reset_jit;
+    return true;
 }
 
 
@@ -697,7 +830,13 @@ PYBIND11_MODULE(desmume, m) {
     m.doc() = "pybind11 desmume plugin"; // optional module docstring
     m.def("add", &add, "A function that adds two numbers");
     m.def("run_desmume", &run_desmume, "A function that runs desmume");
-    m.def("step_desmume", &step_desmume, "A function that steps desmume");
+    m.def("step_desmume", &step_desmume, "A function that steps desmume", py::arg("steps") = 1);
+    m.def("set_python_input", &set_python_input, "A function that enables or disables python input", py::arg("input") = false);
+    m.def("set_fps_limit", &set_fps_limit, "A function that sets fps limit", py::arg("fps") = 60);
+    m.def("get_current_input", &get_current_input, "A function that gets current input");
+    m.def("set_current_input", &set_current_input, "A function that sets current input", py::arg("input"));
+    m.def("read_memory", &read_memory, "A function that reads memory", py::arg("addr"), py::arg("length"), py::arg("proc") = "arm7");
+    m.def("write_memory", &write_memory, "A function that writes memory", py::arg("addr"), py::arg("data"), py::arg("byte_cnt"), py::arg("proc") = "arm7");
 
     auto atexit = py::module_::import("atexit");
     atexit.attr("register")(py::cpp_function([]() {
