@@ -1,11 +1,11 @@
 project('desmume',
   ['c', 'cpp'],
   version: '2.7.10',
-  meson_version: '>=0.45',
+  meson_version: '>=0.63',
   default_options: [
     'warning_level=1',
     'c_std=c11',
-    'cpp_std=c++14',
+    'cpp_std=c++20',
   ],
   license: 'GPL2+',
 )
@@ -21,6 +21,7 @@ dep_alsa = dependency('alsa', required: false)
 dep_soundtouch = dependency('soundtouch', required: false)
 dep_agg = dependency('libagg', required: false)
 dep_fontconfig = dependency('fontconfig', required: false)
+dep_pybind11 = dependency('pybind11', required : get_option('python'))
 
 # XXX: something wrong with this one.
 #dep_lua = dependency('lua-5.1', required: false)
@@ -256,4 +257,7 @@ if get_option('frontend-cli')
 endif
 if get_option('frontend-gtk')
   subdir('gtk')
+endif
+if get_option('python')
+    subdir('python')
 endif

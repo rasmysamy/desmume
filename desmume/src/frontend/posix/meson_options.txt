@@ -23,3 +23,8 @@ option('gdb-stub',
   value: false,
   description: 'Enable gdb stub',
 )
+option('python',
+  type: 'boolean',
+  value: true,
+  description: 'Enable python bindings',
+)
